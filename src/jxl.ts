@@ -5,6 +5,7 @@
 
 import proj4 from 'proj4';
 import { detectCrs, type CrsInfo } from './crs';
+import { calibrationFromJob, type Calibration } from './calibration';
 import { applyPlaneAdjustment } from './datum';
 import { attrEntries, child, children, flatten, num, text_, type Attrs } from './xml';
 import { reduceTotalStation, type TsContext } from './totalstation';
@@ -78,6 +79,8 @@ export interface JxlDocument {
   format?: 'jxl' | 'rw5';
   /** Where a job in assumed coordinates was placed on the map by hand. */
   placement?: Placement;
+  /** Site calibration, checkshots and RTK base connections, when the job has any. */
+  calibration?: Calibration;
 }
 
 export class JxlParseError extends Error {}
@@ -187,7 +190,23 @@ export function parseJxl(text: string, options: ParseOptions = {}): JxlDocument 
 
   const gridOnlyCount = points.filter((p) => p.coords.lat === undefined && p.coords.north !== undefined).length;
 
-  return { points, metadata: metadata(root, points, crs), gridOnlyCount, crs, job: Object.fromEntries(attrEntries(root)) };
+  const calibration = calibrationFromJob(root, {
+    toGrid: toGrid
+      ? (lat, lon) => {
+          const [e, n] = toGrid.forward([lon, lat]);
+          return [n, e];
+        }
+      : undefined,
+  });
+
+  return {
+    points,
+    metadata: metadata(root, points, crs),
+    gridOnlyCount,
+    crs,
+    job: Object.fromEntries(attrEntries(root)),
+    ...(calibration && { calibration }),
+  };
 }
 
 function metadata(root: Element, points: JxlPoint[], crs: CrsInfo): MetadataSection[] {

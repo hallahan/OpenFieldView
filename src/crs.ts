@@ -1,5 +1,6 @@
 // Work out the job's datum, epoch and projection from the JobXML.
 
+import { verticalAdjustment } from './calibration';
 import { nad83ChainFromJob, planeAdjustmentFromJob, type Helmert, type PlaneAdjustment } from './datum';
 import { formatLength, unitOf } from './properties';
 import { child, num, text_ } from './xml';
@@ -121,6 +122,13 @@ export function detectCrs(root: Element): CrsInfo {
       'Horizontal adjustment',
       `shift N ${adjustment.translationNorth.toFixed(3)} m, E ${adjustment.translationEast.toFixed(3)} m, ` +
         `rotation ${(adjustment.rotation * 3600).toFixed(2)}″, scale ${((adjustment.scale - 1) * 1e6).toFixed(2)} ppm`,
+    ]);
+  }
+  const plane = vertical && verticalAdjustment(vertical);
+  if (plane && /InclinedPlane/.test(plane.type) && num(vertical!, 'ConstantAdjustment') !== undefined) {
+    entries.push([
+      'Vertical adjustment',
+      `constant ${plane.constant.toFixed(3)} m, slope N ${(plane.slopeNorth * 1e6).toFixed(2)} ppm, E ${(plane.slopeEast * 1e6).toFixed(2)} ppm`,
     ]);
   }
   if (distanceUnits) entries.push(['Distance units', distanceUnits]);

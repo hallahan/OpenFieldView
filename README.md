@@ -10,6 +10,7 @@ OpenFieldView is a fully client-side web app. Open a `.jxl` or `.rw5` file and y
 - linework built from the points' feature codes, styled from a Trimble feature library (`.fxl`) if you add one, with each line's properties a tap away
 - a searchable point list with each point's position, field-captured feature attributes, and every raw attribute in the file
 - metadata about the job: job properties, coordinate system, units, record counts, time span, and bounds
+- a Calibration tab for GNSS jobs: site calibration parameters, the point pairs and their residuals, checkshots on control, and the RTK bases (mount point, virtual base, reference station) the job was measured from
 
 Opening or dropping a file only shows it; it's parsed in the browser. It leaves your machine only if you tap **Upload** to send it to a GitHub repo.
 
@@ -90,7 +91,11 @@ The rotation is the angle added to the job's bearings to give true bearings. The
 
 ### Site calibration
 
-Grid coordinates in a calibrated job include Trimble's horizontal plane adjustment (`HorizontalAdjustmentRecord`). OpenFieldView removes it before un-projecting grid-only points, which matches Trimble Access to the millimetre. The vertical adjustment (geoid plus inclined plane) doesn't affect map position and isn't applied. For other zones, enter an EPSG code (looked up on epsg.io) or a proj4 string in the sidebar.
+Grid coordinates in a calibrated job include Trimble's horizontal plane adjustment (`HorizontalAdjustmentRecord`). OpenFieldView removes it before un-projecting grid-only points, which matches Trimble Access to the millimetre. The vertical adjustment (geoid plus inclined plane) doesn't affect map position and isn't applied.
+
+The **Calibration** tab shows the calibration in force: the horizontal shift, rotation and scale, the vertical constant and slopes, and each point pair's residuals (control minus calibrated GNSS). An imported calibration has no residuals in the file, so they're worked out from each GNSS point's computed grid. Stakeout checkshots on control are listed with their deltas. Each RTK base connection is listed with its mount point, the virtual base position from Trimble Access's VRS note, and the physical reference station. If a base lands near another point in the job, such as the same station keyed in from an older job, the offset between them is shown. When a network re-publishes its station coordinates, that offset is how far an old calibration will miss.
+
+For other zones, enter an EPSG code (looked up on epsg.io) or a proj4 string in the sidebar.
 
 Grid values are shown in the job's distance units (US survey feet, international feet or metres).
 

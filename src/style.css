@@ -119,6 +119,17 @@ table { width: 100%; border-collapse: collapse; }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 table.kv th, table.kv td { text-align: left; vertical-align: top; padding: 3px 6px; border-bottom: 1px solid var(--border); word-break: break-word; }
 table.kv th { font-family: var(--font-sans); font-size: 13px; font-weight: 500; color: var(--muted); width: 45%; }
+/* Calibration tab. */
+.cal-summary p { margin: 0 0 6px; font: 14px/1.45 var(--font-sans); }
+table.cal-table th, table.cal-table td { text-align: left; vertical-align: top; padding: 4px 5px; border-bottom: 1px solid var(--border); }
+table.cal-table th { font: 600 12px var(--font-sans); color: var(--muted); white-space: nowrap; }
+table.cal-table th .unit { font-weight: 400; }
+table.cal-table td { font-family: var(--font-mono); font-size: 14px; font-variant-numeric: tabular-nums; }
+table.cal-table .n { text-align: right; white-space: nowrap; }
+table.cal-table .cal-name { word-break: break-all; }
+table.cal-table .sub-value { font-family: var(--font-sans); font-size: 12px; word-break: break-word; }
+table.cal-table tr[data-point] { cursor: pointer; }
+table.cal-table tr[data-point]:hover { background: var(--panel); }
 /* Properties of the selected point, in place of the list. */
 #point-detail { display: flex; flex-direction: column; gap: 4px; scroll-margin-top: 0; }
 .detail-head {

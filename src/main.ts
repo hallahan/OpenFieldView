@@ -2,6 +2,7 @@ import maplibregl, { type GeoJSONSource, type StyleSpecification } from 'maplibr
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './style.css';
 import type { FeatureCollection, Point } from 'geojson';
+import { calibrationHtml } from './calibrationview';
 import { PRESETS } from './crs';
 import { currentEpoch, nad83ToWgs84 } from './datum';
 import { DEFAULT_CONTROLS, jobLibraryName, lookupFeature, parseFxl, type FeatureLibrary } from './fxl';
@@ -536,6 +537,7 @@ function load(text: string, name: string, size: number, gridDef?: { input: strin
   showTab('points');
   renderTable();
   renderMetadata();
+  renderCalibration();
   renderDetail();
   renderLibrary();
   setSheet(false);
@@ -689,6 +691,7 @@ function useLibrary(lib: FeatureLibrary | undefined, note = '') {
     renderTable();
     renderDetail();
     renderMetadata();
+    renderCalibration();
   }
   renderLibrary();
 }
@@ -886,6 +889,7 @@ function showTab(tab: string) {
   document.querySelectorAll<HTMLButtonElement>('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#tab-points').hidden = tab !== 'points';
   $('#tab-metadata').hidden = tab !== 'metadata';
+  $('#tab-calibration').hidden = tab !== 'calibration';
 }
 
 $('#search').addEventListener('input', renderTable);
@@ -1169,6 +1173,23 @@ function renderMetadata() {
   $('#tab-metadata').innerHTML = sections.map((s) => table(s.title, s.entries)).join('');
 }
 
+/** The Calibration tab, shown when the job has a site calibration, checkshots or RTK bases. */
+function renderCalibration() {
+  const cal = doc?.calibration;
+  const button = $<HTMLButtonElement>('#tabs button[data-tab="calibration"]');
+  button.hidden = !cal;
+  const el = $('#tab-calibration');
+  if (!cal || !doc) {
+    el.innerHTML = '';
+    if (button.classList.contains('active')) showTab('points');
+    return;
+  }
+  const byName = new Map<string, number>();
+  for (const p of doc.points) if (!p.deleted) byName.set(p.name, p.index);
+  el.innerHTML = calibrationHtml(cal, jobUnit(), (name) => byName.get(name));
+  el.querySelectorAll<HTMLElement>('tr[data-point]').forEach((tr) => tr.addEventListener('click', () => select(Number(tr.dataset.point), true)));
+}
+
 function table(title: string, entries: [string, string][]) {
   if (!entries.length) return '';
   return `${title ? `<h3>${esc(title)}</h3>` : ''}<table class="kv">${entries
@@ -1382,6 +1403,7 @@ function setPlacement(pl: Placement | undefined, save: boolean) {
     renderTable();
     renderDetail();
     renderMetadata();
+    renderCalibration();
   } else if (!redrawQueued) {
     // Dragging: redraw once a frame at most, so the controller keeps up.
     redrawQueued = true;
@@ -1640,4 +1662,5 @@ function setLocalView(on: boolean) {
   renderTable();
   renderDetail();
   renderMetadata();
+  renderCalibration();
 }
