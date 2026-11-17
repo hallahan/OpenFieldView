@@ -13,6 +13,9 @@ import { initJobs, type JobOrigin } from './jobs';
 import { buildLinework, parseCode, type LineFigure, type Linework } from './linework';
 import { lineGroups, linesAtPoint } from './lineprops';
 import { gridFitsProjection, projectGrid, resolveProjection } from './projection';
+import { isGgf, readGgf, type GeoidGrid } from './geoid';
+import { geoidKey, getGeoid, saveGeoid } from './geoidstore';
+import { isJob, jobGeoidFile, jobToJxl } from './job';
 import { isRw5, parseRw5, UNIT_LABELS, type Rw5Units } from './rw5';
 import { featureGroups } from './featureprops';
 import { initLocalGrid, localStyle } from './localgrid';
@@ -428,9 +431,63 @@ function refreshMap(fit: boolean) {
 // ---------------------------------------------------------------- loading
 
 async function loadFile(file: File) {
-  const text = await file.text();
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (isGgf(bytes)) return addGeoid(bytes, file.name);
+  if (isJob(bytes)) return loadJob(bytes, file.name, file.size);
+  const text = new TextDecoder().decode(bytes);
   if (isLibraryFile(file.name, text)) addLibrary(text, file.name);
   else load(text, file.name, file.size);
+}
+
+// A binary Trimble Access job is read as the JobXML it translates to. The job
+// stores ellipsoid heights and names a geoid model; elevations need that
+// model's file, which is kept on the device once it has been opened.
+let openJob: { bytes: Uint8Array; name: string; size: number } | undefined;
+/** Set by loadJob for the load() it is about to make. */
+let nextJob: { job: typeof openJob; note: string } | undefined;
+const sessionGeoids = new Map<string, GeoidGrid>();
+
+async function loadJob(bytes: Uint8Array, name: string, size: number) {
+  try {
+    const wanted = jobGeoidFile(bytes);
+    let geoid = wanted ? sessionGeoids.get(geoidKey(wanted)) : undefined;
+    if (wanted && !geoid) {
+      const stored = await getGeoid(wanted);
+      if (stored) {
+        geoid = readGgf(stored);
+        sessionGeoids.set(geoidKey(wanted), geoid);
+      }
+    }
+    const note =
+      wanted && !geoid
+        ? `GNSS points have no elevations yet. This job uses the geoid model ${wanted}: open ${wanted}.ggf from the controller's System Files folder once, and it's kept on this device.`
+        : '';
+    nextJob = { job: { bytes, name, size }, note };
+    load(jobToJxl(bytes, { geoid }), name, size);
+  } catch (e) {
+    setStatus(esc((e as Error).message), true);
+  } finally {
+    nextJob = undefined;
+  }
+}
+
+async function addGeoid(bytes: Uint8Array, fileName: string) {
+  let geoid: GeoidGrid;
+  try {
+    geoid = readGgf(bytes);
+  } catch (e) {
+    setStatus(`${esc(fileName)}: ${esc((e as Error).message)}`, true);
+    return;
+  }
+  sessionGeoids.set(geoidKey(fileName), geoid);
+  const kept = await saveGeoid(fileName, bytes);
+  if (openJob) await loadJob(openJob.bytes, openJob.name, openJob.size);
+  else {
+    setStatus(
+      `Geoid model <strong>${esc(geoid.name || fileName)}</strong> added. Jobs that use it now get elevations.` +
+        (kept ? '' : "<br><span class=\"muted\">This browser won't keep it, so add it again next time.</span>"),
+    );
+  }
 }
 
 function isLibraryFile(name: string, text: string) {
@@ -474,7 +531,10 @@ function load(text: string, name: string, size: number, gridDef?: { input: strin
     setStatus((e as Error).message, true);
     return;
   }
+  // Reloading the same job (a new coordinate system, say) keeps what was known about it.
+  const reloaded = loaded?.text === text;
   loaded = { text, name, size, origin };
+  openJob = nextJob?.job ?? (reloaded ? openJob : undefined);
   jobs.setOpenFile({ doc, text, name, origin });
   selected = undefined;
   selectedLine = undefined;
@@ -526,7 +586,7 @@ function load(text: string, name: string, size: number, gridDef?: { input: strin
   if (localView) showLocal();
   else localGrid.set(undefined, 1);
   applyStyle();
-  statusNote = { name, projected: projected ? `${projected} grid points placed using ${projectionLabel}.` : '' };
+  statusNote = { name, projected: projected ? `${projected} grid points placed using ${projectionLabel}.` : '', geoid: nextJob?.note ?? (reloaded ? statusNote.geoid : '') };
   renderLoadStatus();
   $('#align-row').hidden = !doc.crs.nad83;
   alignPoints();
@@ -599,7 +659,7 @@ function renderProjection() {
 }
 
 /** The open file and how its points got on the map, for the status line. */
-let statusNote = { name: '', projected: '' };
+let statusNote = { name: '', projected: '', geoid: '' };
 
 function renderLoadStatus() {
   if (!doc) return;
@@ -613,6 +673,7 @@ function renderLoadStatus() {
   setStatus(
     `<strong>${esc(statusNote.name)}</strong>: ${doc.points.length} points${types.length ? ` (${types.join(', ')})` : ''}${local ? '' : `, ${mapped} on the map`}.` +
       (statusNote.projected ? `<br><span class="muted">${esc(statusNote.projected)}</span>` : '') +
+      (statusNote.geoid ? `<br><span class="muted">${esc(statusNote.geoid)}</span>` : '') +
       (placed ? `<br><span class="muted">${placed} points in assumed coordinates, placed by hand.</span>` : '') +
       (local ? `<br><span class="muted">${local} points shown in their own assumed coordinates.</span>` : ''),
   );
@@ -1235,7 +1296,7 @@ const pointers = new Set<number>();
 
 /** The job's own name, so every version of it opened from a repo shares its settings. */
 function jobKey() {
-  return doc?.job.jobName || (loaded?.name ?? '').replace(/(_[0-9a-f]{7})?\.(jxl|rw5)$/i, '');
+  return doc?.job.jobName || (loaded?.name ?? '').replace(/(_[0-9a-f]{7})?\.(jxl|rw5|job)$/i, '');
 }
 
 function offsetKey() {

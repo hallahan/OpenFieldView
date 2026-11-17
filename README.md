@@ -1,10 +1,10 @@
 # OpenFieldView
 
-A free and open source way to get field data off your data collector, onto a map, and into the cloud, without paying for a SaaS subscription. It reads Trimble JobXML (`.jxl`) and Carlson SurvCE / SurvPC raw data (`.rw5`), and will grow to cover other data collector formats.
+A free and open source way to get field data off your data collector, onto a map, and into the cloud, without paying for a SaaS subscription. It reads Trimble JobXML (`.jxl`), Trimble Access job files (`.job`, see [docs/job-format.md](docs/job-format.md)) and Carlson SurvCE / SurvPC raw data (`.rw5`), and will grow to cover other data collector formats.
 
 Try it at https://hallahan.github.io/OpenFieldView/.
 
-OpenFieldView is a fully client-side web app. Open a `.jxl` or `.rw5` file and you get:
+OpenFieldView is a fully client-side web app. Open a `.jxl`, `.job` or `.rw5` file and you get:
 
 - its points on a MapLibre map (streets or satellite basemap), coloured by code
 - linework built from the points' feature codes, styled from a Trimble feature library (`.fxl`) if you add one, with each line's properties a tap away
@@ -13,6 +13,16 @@ OpenFieldView is a fully client-side web app. Open a `.jxl` or `.rw5` file and y
 - a Calibration tab for GNSS jobs: site calibration parameters, the point pairs and their residuals, checkshots on control, and the RTK bases (mount point, virtual base, reference station) the job was measured from
 
 Opening or dropping a file only shows it; it's parsed in the browser. It leaves your machine only if you tap **Upload** to send it to a GitHub repo.
+
+## Trimble Access job files (JOB)
+
+A `.job` is the controller's own binary file, so it can be opened straight off the data collector without exporting JobXML first. Trimble doesn't publish the format; [docs/job-format.md](docs/job-format.md) is what has been worked out by comparing jobs with JobXML exported from them. OpenFieldView translates the job to JobXML and shows it the same way: points, codes and feature attributes, edits, renames and deletes, GNSS shots with their precisions, satellites and tilt, averaged points, the site calibration with its residuals, and the RTK bases.
+
+A job stores what was measured, not the coordinates Trimble Access shows, so OpenFieldView reduces each GNSS shot itself (base, vector, antenna height, tilt) and projects it with the job's coordinate system and calibration. On the jobs it has been checked against, positions, grid coordinates and elevations agree with Trimble's JobXML to 0.01 mm.
+
+Elevations need the geoid model, which isn't in the job. The job names it (`g18us` for GEOID18), and the file is in the controller's `Trimble Data/System Files` folder. Open or drop that `.ggf` once and it's kept on the device for every job that uses it. Until then, measured points have a position and an ellipsoid height but no elevation.
+
+Not read yet: total station observations and stakeouts, which haven't turned up in a job that also has JobXML to check against. Uploading a job from the Jobs tab stores its JobXML translation.
 
 ## Carlson raw data (RW5)
 
