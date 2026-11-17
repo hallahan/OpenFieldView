@@ -5,7 +5,8 @@
 // against their JobXML in job.compare.test.ts.
 
 import { describe, expect, it } from 'vitest';
-import { crc16, groundUnderAntenna, isJob, jobToJxl, JobParseError, parseJob, readJob } from './job';
+import { readGgf } from './geoid';
+import { crc16, groundUnderAntenna, isJob, jobGeoidFile, jobToJxl, JobParseError, parseJob, readJob } from './job';
 
 const NULL = new Uint8Array([0xa0, 0xc8, 0xeb, 0x85, 0xf3, 0xcc, 0xe1, 0x7f]);
 const RAD = Math.PI / 180;
@@ -97,7 +98,7 @@ const BASE = [37.3, -121.9, -10] as const;
 const DELTA = [12.5, -3.25, 4] as const;
 const ATTITUDE = { yaw: -30 * RAD, pitch: 5 * RAD, roll: -2 * RAD };
 
-function sampleJob(): Uint8Array {
+function sampleJob(more?: (add: (r: Uint8Array) => void) => void): Uint8Array {
   const parts: Uint8Array[] = [header()];
   const add = (r: Uint8Array) => parts.push(r);
   // Job created as "Template", renamed to "Synthetic".
@@ -148,6 +149,7 @@ function sampleJob(): Uint8Array {
   // A keyed-in grid point.
   add(record(NEW, 0, 2, 40, point('CP1', [{ name: 'CTRLP' }], 'KI', 1, 0, 9)));
   add(record(CHILD, 40, 17, 41, new Bytes().u8(0).f64(600000).f64(1900000).f64(25).bytes));
+  more?.(add);
 
   const total = parts.reduce((n, p) => n + p.length, 0);
   const out = new Uint8Array(total);
@@ -269,3 +271,123 @@ function addEcef(p: [number, number, number], d: readonly number[]): [number, nu
   const x = toEcef(...p);
   return fromEcef([x[0] + d[0], x[1] + d[1], x[2] + d[2]]);
 }
+
+// A geoid grid file whose surface is a plane: -30 m at 37°N 122°W, rising
+// 1 m per degree north and 2 m per degree east.
+function planeGgf(): Uint8Array {
+  const [south, west, step, rows, cols] = [37, 237.5, 0.1, 11, 11];
+  const b = new Bytes().u8(0, 0).chars('TNL GRID FILE').u8(0).chars('Plane').zeros(27);
+  b.f64(south).f64(south + step * (rows - 1)).f64(west).f64(west + step * (cols - 1)).f64(step).f64(step).i32(rows).i32(cols).zeros(42);
+  const cells = new Float32Array(rows * cols);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) cells[r * cols + c] = -30 + r * step + 2 * (west + c * step - 238);
+  return new Uint8Array([...b.bytes, ...new Uint8Array(cells.buffer)]);
+}
+
+/** A second day's work on the sample job: a calibration, edits and repeat shots. */
+function busyJob(): Uint8Array {
+  return sampleJob((add) => {
+    // Vertical adjustment: geoid model "plane" and a calibration constant.
+    const vertical = new Bytes().u8(0).chars('CB').u16(4).f64(600000).f64(1900000).f64(0).f64(0).f64(-0.02).str('plane').i32(-1);
+    add(record(NEW, 0, 40, 50, vertical.bytes));
+    add(record(NEW, 0, 54, 51, new Bytes().u8(0).str('Lib').str('/files/Lib.fxl').str('Lib.fxl').u8(0, 0, 0, 1).bytes));
+    add(record(NEW, 0, 49, 52, new Bytes().u8(0, 1, 0).bytes));
+    add(record(NEW, 0, 151, 53, new Bytes().u8(0).str('MOUNT').str('CMRx').str('Network').str('10.0.0.1').u16(2101).zeros(21).bytes));
+    const pair = new Bytes().u8(0).str('CP1').str('100').u8(3, 0).f64(-0.01).f64(0.02).f64(0.0224).f64(600000).f64(1900000).f64(25);
+    add(record(NEW, 0, 44, 54, pair.f64(0.012).f64(-0.016).f64(0.01).u32(20).bytes));
+    // An untilted shot whose attributes were edited before it was stored, so
+    // the point record opens with a note. Later renamed from 200 to 201.
+    const noted = new Bytes().str('Modified 9:40:00 AM 3/2/2026\r\nOld values TREE\r\n').u8(...features([{ name: 'TREE' }]).bytes.subarray(1));
+    noted.str('').zeros(7).str('200').chars('TP').u16(13).u16(15).u16(4).u16(0).u16(1);
+    add(record(NEW, 0, 2, 60, noted.bytes));
+    add(record(CHILD, 60, 8, 61, new Bytes().u8(0).f64(DELTA[0]).f64(DELTA[1]).f64(DELTA[2]).u32(14).u32(16).bytes));
+    add(record(NEW, 0, 172, 62, new Bytes().u8(0, 1).f64(0.5 * RAD).f64(-0.25 * RAD).bytes));
+    add(record(NEW, 0, 33, 63, new Bytes().u8(0).u16(19).f64(0.01).f64(1e-5).f64(2e-6).f64(-3e-6).f64(4e-5).f64(5e-6).f64(6e-5).f64(1).bytes));
+    add(record(NEW, 0, 31, 64, new Bytes().u8(0).bytes));
+    add(record(CHILD, 60, 1003, 65, new Bytes().u8(0, 0).str('201').bytes));
+    // A point copied from a control file.
+    const copied = new Bytes().u8(...features([{ name: 'CTRL' }]).bytes).str('').zeros(7).str('CP2').chars('CC').u16(59).u16(0).u16(4).u8(0).str('/files/control.csv').u16(0);
+    add(record(NEW, 0, 2, 70, copied.bytes));
+    add(record(CHILD, 70, 17, 71, new Bytes().u8(0).f64(600100).f64(1900100).f64(26).bytes));
+    // Point 100 measured again as a check, then the average of both.
+    add(record(NEW, 0, 2, 80, point('100', [], 'TP', 13, 15, 0)));
+    add(record(CHILD, 80, 8, 81, new Bytes().u8(0).f64(DELTA[0]).f64(DELTA[1]).f64(DELTA[2] + 1).u32(14).u32(16).bytes));
+    add(record(NEW, 0, 31, 82, new Bytes().u8(0).bytes));
+    add(record(NEW, 0, 2, 90, point('100', [], 'AV', 1, 0, 7)));
+    add(record(CHILD, 90, 15, 91, wgs84(37.3001, -121.9001, -8)));
+    add(record(NEW, 0, 144, 92, new Bytes().u8(0).f64(0.001).f64(0.002).f64(0.003).bytes));
+    const residuals = new Bytes().u8(0).u32(1).zeros(17).u32(20).u8(1).f64(0.004).f64(-0.005).f64(0.006).f64(null).f64(null).f64(null).zeros(2);
+    add(record(NEW, 0, 155, 93, residuals.bytes));
+    add(record(NEW, 0, 31, 94, new Bytes().u8(0).bytes));
+  });
+}
+
+describe('a job with a calibration, edits and repeat shots', () => {
+  const bytes = busyJob();
+  const geoid = readGgf(planeGgf());
+  const xml = jobToJxl(bytes, { geoid });
+  const doc = parseJob(bytes, { geoid });
+  const byName = new Map(doc.points.map((p) => [p.name, p]));
+  const record = (id: number) => xml.slice(xml.indexOf(`ID="${id.toString(16).padStart(8, '0')}"`)).split(/<\/\w+Record>/)[0];
+
+  it('names the geoid model the job needs', () => {
+    expect(jobGeoidFile(bytes)).toBe('plane');
+    expect(jobGeoidFile(sampleJob())).toBeUndefined();
+    expect(record(50)).toContain('<GeoidName>Plane</GeoidName>');
+  });
+
+  it('works out elevations from the geoid model and the vertical adjustment', () => {
+    const c = byName.get('201')!.coords;
+    // The job's ellipsoid is GRS80, so the height above it is found first.
+    const n = -30 + (c.lat! - 37) + 2 * (c.lon! + 122);
+    expect(c.elevation).toBeCloseTo(c.height! - n - 0.02, 3);
+    expect(record(60)).toContain('<ComputedGrid>');
+    expect(parseJob(bytes).points.find((p) => p.name === '201')!.coords.elevation).toBeUndefined();
+  });
+
+  it('reads a point that opens with a note, and its rename', () => {
+    expect(record(60)).toContain('<Name>201</Name>');
+    expect(record(60)).toContain('<Note>Old values TREE</Note>');
+    expect(byName.get('201')!.code).toBe('TREE');
+    expect(byName.has('200')).toBe(false);
+  });
+
+  it('reads bubble tilt and the vector covariance', () => {
+    expect(record(60)).toMatch(/<Type>VerticalTiltError<\/Type>\s*<Attitude>\s*<Pitch>0.5<\/Pitch>\s*<Roll>-0.25<\/Roll>/);
+    expect(record(60)).toMatch(/<QualityControl2>\s*<NumberOfSatellites>19<\/NumberOfSatellites>\s*<ErrorScale>0.01</);
+    expect(record(60)).toContain('<VCVzz>0.00006</VCVzz>');
+  });
+
+  it('reads a copied point and the file it came from', () => {
+    expect(record(70)).toContain('<Method>CopiedPoint</Method>');
+    expect(record(70)).toContain('<Source>/files/control.csv</Source>');
+    expect(byName.get('CP2')!.coords.elevation).toBe(26);
+  });
+
+  it('keeps one point per name, by class', () => {
+    expect(doc.points.filter((p) => p.name === '100')).toHaveLength(1);
+    const p = byName.get('100')!;
+    expect(p.id).toBe('0000005a');
+    expect(p.classification).toBe('Averaged');
+    expect(p.coords.lat).toBeCloseTo(37.3001, 9);
+    expect(record(90)).toMatch(/<EastStandardDeviation>0.002</);
+    expect(record(90)).toMatch(/<ObservationID>00000014<\/ObservationID>\s*<IncludedInAverageComputation>true</);
+    expect(record(90)).toMatch(/<DeltaElevation>0.006</);
+  });
+
+  it('reads the calibration, its residuals and the RTK data source', () => {
+    expect(doc.calibration?.vertical).toMatchObject({ type: 'GeoidModelAndInclinedPlane', constant: -0.02 });
+    expect(doc.calibration?.pairs).toEqual([
+      {
+        gridPoint: 'CP1',
+        gnssPoint: '100',
+        dimension: '3D',
+        residual: { north: 0.012, east: -0.016, elevation: 0.01, horizontal: 0.02, vertical: -0.01 },
+        residualSource: 'File',
+      },
+    ]);
+    expect(doc.calibration?.bases[0]).toMatchObject({ base: 'BASE' });
+    expect(record(53)).toMatch(/<MountPoint>MOUNT<\/MountPoint>\s*<DataFormat>CMRx<\/DataFormat>\s*<Solution>Network<\/Solution>\s*<IPAddress>10.0.0.1<\/IPAddress>\s*<IPPort>2101</);
+    expect(record(51)).toMatch(/<LibraryName>Lib<\/LibraryName>\s*<SourceFilename>Lib.fxl</);
+    expect(record(52)).toContain('<Event>StartRoverSurvey</Event>');
+  });
+});

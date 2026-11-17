@@ -14,6 +14,16 @@ OpenFieldView is a fully client-side web app. Open a `.jxl`, `.job` or `.rw5` fi
 
 Opening or dropping a file only shows it; it's parsed in the browser. It leaves your machine only if you tap **Upload** to send it to a GitHub repo.
 
+## Trimble Access job files (JOB)
+
+A `.job` is the controller's own binary file, so it can be opened straight off the data collector without exporting JobXML first. Trimble doesn't publish the format; [docs/job-format.md](docs/job-format.md) is what has been worked out by comparing jobs with JobXML exported from them. OpenFieldView translates the job to JobXML and shows it the same way: points, codes and feature attributes, edits, renames and deletes, GNSS shots with their precisions, satellites and tilt, averaged points, the site calibration with its residuals, and the RTK bases.
+
+A job stores what was measured, not the coordinates Trimble Access shows, so OpenFieldView reduces each GNSS shot itself (base, vector, antenna height, tilt) and projects it with the job's coordinate system and calibration. On the jobs it has been checked against, positions, grid coordinates and elevations agree with Trimble's JobXML to 0.01 mm.
+
+Elevations need the geoid model, which isn't in the job. The job names it (`g18us` for GEOID18), and the file is in the controller's `Trimble Data/System Files` folder. Open or drop that `.ggf` once and it's kept on the device for every job that uses it. Until then, measured points have a position and an ellipsoid height but no elevation.
+
+Not read yet: total station observations and stakeouts, which haven't turned up in a job that also has JobXML to check against. Uploading a job from the Jobs tab stores its JobXML translation.
+
 ## Carlson raw data (RW5)
 
 An RW5 is a log of the raw observations, so OpenFieldView reduces them itself: side shots and traverses (`SS`, `TR`) from the occupied point and backsight (`OC`, `BK`, `LS`), angle sets (`BD`, `FD`, `FR`, `BR`) averaged across faces and sets, stored points (`SP`) and GPS positions (`GPS`, with their `--GS` local grid and `G0`-`G3` / `--HRMS` quality). Angles right are taken as circle readings from the backsight's, as SurvCE writes them, and the `MO` record's units, south azimuths, scale factor and curvature setting are applied. A shot to a point that's already known is kept as a check shot and doesn't move it. Each point's description is its code, so linework works as for a JXL, and `--` notes after a shot appear in its properties.

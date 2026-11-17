@@ -10,16 +10,19 @@
 //
 // Rather than build a second document model, the job is translated into
 // JobXML and handed to the JobXML parser, so everything downstream (map,
-// properties, linework) works the same for both. The JOB doesn't store the
-// grid coordinates or ground positions Trimble Access computes, so GNSS shots
-// are reduced here (base + vector, antenna height and tilt) and grid
-// coordinates are projected from the job's own coordinate system.
+// properties, linework, calibration) works the same for both. The JOB doesn't
+// store the ground positions, grid coordinates or elevations Trimble Access
+// computes, so GNSS shots are reduced here (base + vector, antenna height and
+// tilt), projected with the job's own coordinate system and calibration, and
+// given elevations from the geoid model when its file is supplied.
 //
 // Read-only: nothing here writes JOB files.
 
 import proj4 from 'proj4';
+import { verticalAdjustment, type VerticalAdjustment } from './calibration';
 import { detectCrs } from './crs';
-import { applyPlaneAdjustment } from './datum';
+import { applyPlaneAdjustment, removePlaneAdjustment } from './datum';
+import { undulation, type GeoidGrid } from './geoid';
 import { parseJxl, type JxlDocument, type ParseOptions } from './jxl';
 
 export class JobParseError extends Error {}
@@ -60,9 +63,18 @@ export const RecordType = {
   CalibrationPoint: 44,
   GpsEquipment: 45,
   Antenna: 46,
+  SurveyEvent: 49,
   Units: 51,
+  FeatureCoding: 54,
+  Initialisation: 68,
   Reference: 70,
   CoordinateSystem: 87,
+  ActiveMapFiles: 127,
+  GridStandardDeviations: 144,
+  TimeZone: 146,
+  NtripDataSource: 151,
+  AverageResiduals: 155,
+  BubbleTilt: 172,
   KinematicTransformations: 216,
   Deleted: 1000,
   JobName: 1003,
@@ -220,6 +232,8 @@ export interface JobFeature {
 
 export interface JobPointRecord {
   name: string;
+  /** Note text stored with the point: "Modified ...", "Old values ...". */
+  note: string;
   features: JobFeature[];
   description1: string;
   description2: string;
@@ -228,6 +242,8 @@ export interface JobPointRecord {
   method: string;
   surveyMethod: string;
   classification: string;
+  /** For a point copied from another file, the file it came from. */
+  sourceFile: string;
 }
 
 const ATTRIBUTE_TYPES: Record<number, string> = { 0: 'Numeric', 1: 'Text', 2: 'Menu', 5: 'File', 8: 'Photo' };
@@ -239,10 +255,11 @@ const METHODS: Record<number, string> = {
   6: 'BearingDistancePointIntersection',
   11: 'GpsStaticObservation',
   13: 'GpsRTKControlPoint',
+  59: 'CopiedPoint',
   60: 'FromBase',
 };
 const SURVEY_METHODS: Record<number, string> = { 0: 'KeyedIn', 1: 'Autonomous', 14: 'RTK', 15: 'NetworkRTK' };
-const CLASSIFICATIONS: Record<number, string> = { 3: 'Construction', 4: 'Normal', 7: 'Averaged', 9: 'Control' };
+const CLASSIFICATIONS: Record<number, string> = { 0: 'Check', 3: 'Construction', 4: 'Normal', 7: 'Averaged', 9: 'Control' };
 
 function enumName(map: Record<number, string>, v: number): string {
   return map[v] ?? `Unknown${v}`;
@@ -250,7 +267,6 @@ function enumName(map: Record<number, string>, v: number): string {
 
 /** The feature codes and their attributes, as in a point or a type 1004 record. */
 function readFeatures(c: Cursor): JobFeature[] {
-  c.u8();
   const n = c.u32();
   const out: JobFeature[] = [];
   for (let i = 0; i < n; i++) {
@@ -281,24 +297,25 @@ function readFeatures(c: Cursor): JobFeature[] {
 
 export function decodePoint(payload: Uint8Array): JobPointRecord {
   const c = new Cursor(payload);
+  // The record opens with the point's note text (empty for most points).
+  const note = c.str();
   const features = readFeatures(c);
   const description1 = c.str();
-  // The point name and a fixed 12-byte trailer end the record. What sits
-  // between the first description and the name (7 bytes when empty) isn't
-  // fully known yet, so the name is found from the end.
-  const trailer = payload.length - 12;
-  let start = trailer - 1;
-  while (start > c.o && payload[start - 1] !== 0) start--;
-  const middle = new Cursor(payload.subarray(c.o, start));
-  const description2 = middle.remaining > 7 ? middle.str() : '';
-  const name = new Cursor(payload, start).str();
-  const t = new Cursor(payload, trailer);
-  const source = t.chars(2);
-  const method = t.u16();
-  const survey = t.u16();
-  const cls = t.u16();
+  // Seven bytes sit between the first description and the name. They are all
+  // zero in every sample so far; the first is taken to be an empty second
+  // description, since a string would fit there.
+  const description2 = c.str();
+  c.o += 6;
+  const name = c.str();
+  const source = c.chars(2);
+  const method = c.u16();
+  const survey = c.u16();
+  const cls = c.u16();
+  c.u8();
+  const sourceFile = c.remaining > 0 ? c.str() : '';
   return {
     name,
+    note,
     features,
     description1,
     description2,
@@ -306,6 +323,7 @@ export function decodePoint(payload: Uint8Array): JobPointRecord {
     method: enumName(METHODS, method),
     surveyMethod: enumName(SURVEY_METHODS, survey),
     classification: enumName(CLASSIFICATIONS, cls),
+    sourceFile,
   };
 }
 
@@ -368,12 +386,14 @@ function decodeEquipment(payload: Uint8Array): Equipment {
   };
 }
 
+const ANTENNA_MEASUREMENTS: Record<number, string> = { 0: 'Corrected', 3: 'Raw' };
+
 function decodeAntenna(payload: Uint8Array) {
   const c = new Cursor(payload, 1);
   const measuredHeight = c.f64();
   const type = c.u8();
   c.u8();
-  return { measuredHeight, measurementType: type === 3 ? 'Raw' : undefined, equipment: c.u32() };
+  return { measuredHeight, measurementType: ANTENNA_MEASUREMENTS[type], equipment: c.u32() };
 }
 
 // ---------------------------------------------------------------- geodesy
@@ -390,15 +410,15 @@ function geodeticToEcef(lat: number, lon: number, h: number): Vec3 {
   return [(n + h) * Math.cos(lat) * Math.cos(lon), (n + h) * Math.cos(lat) * Math.sin(lon), (n * (1 - E2) + h) * Math.sin(lat)];
 }
 
-function ecefToGeodetic([x, y, z]: Vec3): Vec3 {
+function ecefToGeodetic([x, y, z]: Vec3, a = A, e2 = E2): Vec3 {
   const lon = Math.atan2(y, x);
   const p = Math.hypot(x, y);
-  let lat = Math.atan2(z, p * (1 - E2));
+  let lat = Math.atan2(z, p * (1 - e2));
   let h = 0;
   for (let i = 0; i < 10; i++) {
-    const n = A / Math.sqrt(1 - E2 * Math.sin(lat) ** 2);
+    const n = a / Math.sqrt(1 - e2 * Math.sin(lat) ** 2);
     h = p / Math.cos(lat) - n;
-    lat = Math.atan2(z, p * (1 - (E2 * n) / (n + h)));
+    lat = Math.atan2(z, p * (1 - (e2 * n) / (n + h)));
   }
   return [lat, lon, h];
 }
@@ -463,7 +483,17 @@ class Journal {
   }
   /** Top-level records in file order, each in its latest version. */
   *topLevel(): Generator<JobRecord> {
-    for (const r of this.file.records) if (r.kind === KIND_NEW) yield this.byId.get(r.id) ?? r;
+    for (const r of this.file.records) {
+      if (r.kind !== KIND_NEW) continue;
+      const latest = this.byId.get(r.id) ?? r;
+      if (latest === r) yield r;
+      else {
+        // A replacement keeps the record's place, ID and time, as in JobXML.
+        const current = { ...latest, id: r.id, time: r.time };
+        this.position.set(current, this.position.get(r)!);
+        yield current;
+      }
+    }
   }
   latestChild(id: number, type: number): JobRecord | undefined {
     const list = this.children.get(id);
@@ -516,12 +546,217 @@ function hexId(id: number): string {
 
 const deg = (rad: number) => rad * DEG;
 const degOrUndefined = (rad: number | undefined) => (rad === undefined ? undefined : rad * DEG);
+/** EPSG codes and IDs are -1 when there isn't one. */
+const code = (v: number) => (v < 0 ? undefined : v);
 
-const PROJECTION_TYPES: Record<number, string> = { 7: 'Lambert2Parallel' };
+const PROJECTION_TYPES: Record<number, string> = { 1: 'ScaleOnly', 7: 'Lambert2Parallel' };
 const HORIZONTAL_TYPES: Record<number, string> = { 0: 'NoAdjustment', 1: 'PlaneAdjustment' };
-const VERTICAL_TYPES: Record<number, string> = { 3: 'GeoidModel', 5: 'GeoidModelAndInclinedPlane' };
+// 4 and 5 both come out of Trimble Access as GeoidModelAndInclinedPlane. In the
+// samples 4 is a calibration computed on the controller and 5 one that was
+// carried into a new job; the numbers in them are laid out the same.
+const VERTICAL_TYPES: Record<number, string> = {
+  0: 'NoAdjustment',
+  3: 'GeoidModel',
+  4: 'GeoidModelAndInclinedPlane',
+  5: 'GeoidModelAndInclinedPlane',
+};
 const DISTANCES: Record<number, string> = { 0: 'GridDistance', 2: 'GroundDistance' };
-const DISTANCE_UNITS: Record<number, string> = { 6: 'USSurveyFeet' };
+const DIMENSIONS: Record<number, string> = { 1: '1D', 2: '2D', 3: '3D' };
+
+// Units are numbered in one list across every kind of unit. Only the ones
+// seen in a job with a matching JobXML are named.
+const UNITS: Record<number, string> = {
+  0: 'Metres',
+  6: 'USSurveyFeet',
+  14: 'DMSDegrees',
+  29: 'Celsius',
+  30: 'Fahrenheit',
+  31: 'MilliBar',
+  32: 'InchHg',
+  37: 'SquareMetres',
+  40: 'SquareUSSurveyFeet',
+  50: 'CubicMetres',
+  54: 'CubicUSSurveyYards',
+  59: 'Kilograms',
+  65: 'Pounds',
+};
+const PRECISION_UNITS: Record<number, string> = { 0: '1Sigma', 1: '95Percent', 3: 'DRMS' };
+const SURVEY_EVENTS: Record<number, string> = { 1: 'StartRoverSurvey', 3: 'EndSurvey' };
+const INITIALISATION_EVENTS: Record<number, string> = { 7: 'RTKInitialised', 8: 'RTKNotInitialised' };
+const INITIALISATION_TYPES: Record<number, string> = { 3: 'OnTheFly', 4: 'ResetRTK' };
+
+/** Record types that make up the coordinate system; read first, since points need it. */
+const SYSTEM_TYPES = new Set<number>([
+  RecordType.Units,
+  RecordType.Corrections,
+  RecordType.Ellipsoid,
+  RecordType.Projection,
+  RecordType.Datum,
+  RecordType.HorizontalAdjustment,
+  RecordType.VerticalAdjustment,
+  RecordType.CoordinateSystem,
+  RecordType.KinematicTransformations,
+]);
+
+/** What the coordinate system records say that the rest of the translation needs. */
+interface SystemInfo {
+  projectHeight?: number;
+  systemName?: string;
+  zoneName?: string;
+  datumName?: string;
+  /** File name of the geoid model, without its extension: g18us. */
+  geoidFile?: string;
+  distanceUnits?: string;
+  heightUnits?: string;
+}
+
+/** Write one coordinate system record as JobXML. `geoidName` is the model's own name, when its file is at hand. */
+function writeSystemRecord(x: Xml, r: JobRecord, info: SystemInfo, geoidName?: string) {
+  const c = new Cursor(r.payload);
+  const attrs = { ID: hexId(r.id), TimeStamp: r.time };
+  switch (r.type) {
+    case RecordType.Units: {
+      const u = Array.from({ length: 12 }, (_, i) => (3 + 2 * i <= r.payload.length ? c.at(1 + 2 * i).u16() : -1));
+      info.distanceUnits = UNITS[u[0]];
+      info.heightUnits = UNITS[u[1]];
+      x.open('UnitsRecord', attrs);
+      x.el('DistanceUnits', UNITS[u[0]]);
+      x.el('HeightUnits', UNITS[u[1]]);
+      x.el('AngleUnits', UNITS[u[2]]);
+      x.el('LatitudeLongitudeUnits', UNITS[u[3]]);
+      x.el('TemperatureUnits', UNITS[u[6]]);
+      x.el('PressureUnits', UNITS[u[7]]);
+      x.el('AreaUnits', UNITS[u[9]]);
+      x.el('VolumeUnits', UNITS[u[10]]);
+      if (r.payload.length >= 54) {
+        x.el('PrecisionUnits', PRECISION_UNITS[c.at(50).u16()]);
+        x.el('MassUnits', UNITS[c.u16()]);
+      }
+      x.close('UnitsRecord');
+      break;
+    }
+    case RecordType.Corrections: {
+      x.open('CorrectionsRecord', attrs);
+      const d = c.at(16).u8();
+      x.el('Distances', DISTANCES[d] ?? `Unknown${d}`);
+      x.close('CorrectionsRecord');
+      break;
+    }
+    case RecordType.Ellipsoid: {
+      x.open('EllipsoidRecord', attrs);
+      c.at(3);
+      x.el('EarthRadius', c.f64());
+      x.el('Flattening', c.f64());
+      c.u32();
+      x.el('LocalEllipsoidEPSG', code(c.i32()));
+      x.close('EllipsoidRecord');
+      break;
+    }
+    case RecordType.Projection: {
+      const type = c.at(3).u16();
+      x.open('ProjectionRecord', attrs);
+      x.open('Projection');
+      x.el('Type', PROJECTION_TYPES[type] ?? `Unknown${type}`);
+      // Angles are stored in radians.
+      x.el('CentralLatitude', degOrUndefined(c.at(5).f64()));
+      x.el('CentralLongitude', degOrUndefined(c.at(13).f64()));
+      x.el('Scale', c.at(21).f64());
+      x.el('FalseNorthing', c.at(29).f64());
+      x.el('FalseEasting', c.at(37).f64());
+      x.el('Parallel1', degOrUndefined(c.at(63).f64()));
+      x.el('Parallel2', degOrUndefined(c.at(71).f64()));
+      x.close('Projection');
+      x.open('LocalSite');
+      x.el('Type', 'Grid');
+      // Older versions have two fewer bytes in the middle, so count from the end.
+      info.projectHeight = c.at(r.payload.length - 41).f64();
+      x.el('ProjectLocationHeight', info.projectHeight);
+      x.close('LocalSite');
+      x.close('ProjectionRecord');
+      break;
+    }
+    case RecordType.Datum: {
+      x.open('DatumRecord', attrs);
+      x.el('ReferenceGlobalFrameID', code(c.at(62).i32()));
+      x.el('ReferenceGlobalFrameEPSG', code(c.i32()));
+      x.el('ReferenceGlobalFrameEpoch', c.at(74).f64()?.toFixed(2));
+      x.el('ReferenceGlobalFrameName', c.at(82).str() || undefined);
+      x.el('DisplacementModelName', c.str() || undefined);
+      x.close('DatumRecord');
+      break;
+    }
+    case RecordType.HorizontalAdjustment: {
+      const type = c.at(3).u16();
+      x.open('HorizontalAdjustmentRecord', attrs);
+      x.el('Type', HORIZONTAL_TYPES[type] ?? `Unknown${type}`);
+      x.el('OriginNorth', c.f64());
+      x.el('OriginEast', c.f64());
+      x.el('TranslationNorth', c.f64());
+      x.el('TranslationEast', c.f64());
+      x.el('Rotation', degOrUndefined(c.f64()));
+      x.el('ScaleFactor', c.f64());
+      x.close('HorizontalAdjustmentRecord');
+      break;
+    }
+    case RecordType.VerticalAdjustment: {
+      const type = c.at(3).u16();
+      x.open('VerticalAdjustmentRecord', attrs);
+      x.el('Type', VERTICAL_TYPES[type] ?? `Unknown${type}`);
+      x.el('OriginNorth', c.f64());
+      x.el('OriginEast', c.f64());
+      x.el('SlopeNorthPerUnit', c.f64());
+      x.el('SlopeEastPerUnit', c.f64());
+      x.el('ConstantAdjustment', c.f64());
+      // The job names the model's file; its proper name is in the file itself.
+      const file = c.str();
+      if (file) info.geoidFile = file;
+      x.el('GeoidName', file ? (geoidName ?? file) : undefined);
+      x.el('GeoidFile', file || undefined);
+      x.close('VerticalAdjustmentRecord');
+      break;
+    }
+    case RecordType.CoordinateSystem: {
+      x.open('CoordinateSystemRecord', attrs);
+      c.at(1);
+      info.systemName = c.str();
+      info.zoneName = c.str();
+      info.datumName = c.str();
+      x.el('SystemName', info.systemName);
+      x.el('ZoneName', info.zoneName);
+      x.el('DatumName', info.datumName);
+      if (r.payload.length - c.o >= 12) {
+        c.at(r.payload.length - 12);
+        x.el('ZoneID', code(c.i32()));
+        x.el('ProjectedCoordinateReferenceSystemEPSG', code(c.i32()));
+        x.el('CompoundCoordinateReferenceSystemEPSG', code(c.i32()));
+      }
+      x.close('CoordinateSystemRecord');
+      break;
+    }
+    case RecordType.KinematicTransformations:
+      writeKinematic(x, c, attrs);
+      break;
+  }
+}
+
+/** Options for reading a JOB file. */
+export interface JobOptions {
+  /** Name to give the job, instead of the one stored in it. */
+  jobName?: string;
+  /**
+   * The geoid model the job names (see `jobGeoidFile`). A JOB stores ellipsoid
+   * heights only, so without it measured points have no elevation.
+   */
+  geoid?: GeoidGrid;
+}
+
+/** The geoid model file a job's elevations need, without its extension: "g18us". */
+export function jobGeoidFile(bytes: Uint8Array): string | undefined {
+  const j = new Journal(readJob(bytes));
+  const info: SystemInfo = {};
+  for (const r of j.topLevel()) if (r.type === RecordType.VerticalAdjustment) writeSystemRecord(new Xml(), r, info);
+  return info.geoidFile;
+}
 
 interface PointState {
   record: JobRecord;
@@ -531,122 +766,162 @@ interface PointState {
   grid?: { north: number; east: number; elevation?: number };
 }
 
+/** What a point needs from the rest of the job. */
+interface Context {
+  j: Journal;
+  jobName: string;
+  /** Ground positions of the points read so far, by name. */
+  positions: Map<string, Vec3>;
+  /** The point each of those positions belongs to. */
+  held: Map<string, JobPointRecord>;
+  references: Map<number, { name: string; antenna: number }>;
+  /** Grid position of a WGS84 position, once the job has a projection. */
+  toGrid?: (p: Vec3) => { north: number; east: number; elevation?: number };
+}
+
 /** Translate a JOB file into JobXML text. */
-export function jobToJxl(bytes: Uint8Array, jobName = ''): string {
+export function jobToJxl(bytes: Uint8Array, opts: JobOptions | string = {}): string {
+  const options = typeof opts === 'string' ? { jobName: opts } : opts;
   const file = readJob(bytes);
   const j = new Journal(file);
-  const x = new Xml();
-  const positions = new Map<string, Vec3>();
-  const references = new Map<number, { name: string; antenna: number }>();
-  const points: PointState[] = [];
-  let projectHeight: number | undefined;
   const header = file.records.find((r) => r.type === RecordType.Header);
   // The header names the job it was created as (often a template it was
   // copied from); a rename or copy adds a child of record 0 with the new name.
   const h = header ? new Cursor((j.byId.get(header.id) ?? header).payload, 1) : undefined;
   const created = h ? { name: h.str(), serial: (h.str(), h.str()), version: h.str() } : undefined;
   const renamed = j.latestChild(0, RecordType.JobName);
-  const name = jobName || (renamed ? new Cursor(renamed.payload, 2).str() : (created?.name ?? ''));
+  const name = options.jobName || (renamed ? new Cursor(renamed.payload, 2).str() : (created?.name ?? ''));
 
+  const [major, minor, build] = file.version.split('.');
+  const head = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<JOBFile jobName="${esc(name)}" product="Trimble Access" productVersion="${major}.${minor.padStart(2, '0')}"` +
+      ` productDBVersion="${major}${minor.padStart(2, '0')}-${build}"` +
+      ` controllerSerialNumber="${esc(created?.serial ?? '')}" originalProductVersion="${esc(created?.version ?? '')}"` +
+      ` sourceFormat="JOB" TimeStamp="${header?.time ?? ''}">`,
+    '  <FieldBook>',
+  ];
+
+  // Trimble Access works out grid coordinates, elevations and the combined
+  // scale factor when it exports; the JOB only has the coordinate system. So
+  // that is read first, the same way a JobXML file's is, and points are
+  // reduced with it. The latest records are the ones in force.
+  const info: SystemInfo = {};
+  const system = new Xml();
+  for (const r of j.topLevel()) if (SYSTEM_TYPES.has(r.type)) writeSystemRecord(system, r, info);
+  const systemDoc = new DOMParser().parseFromString([...head, ...system.out, '  </FieldBook>', '</JOBFile>'].join('\n'), 'application/xml');
+  const crs = detectCrs(systemDoc.documentElement);
+  const project = crs.projection ? proj4('EPSG:4326', crs.projection.proj4) : undefined;
+  const verticalRecord = Array.from(systemDoc.getElementsByTagName('VerticalAdjustmentRecord')).at(-1);
+  const vertical = verticalRecord && verticalAdjustment(verticalRecord);
+  // Latitudes and heights are on the job's own ellipsoid. For NAD83 that is
+  // GRS80, a tenth of a millimetre flatter than WGS84: enough to show in a
+  // northing and an elevation.
+  const ellipsoid = Array.from(systemDoc.getElementsByTagName('EllipsoidRecord'))
+    .map((e) => ({ a: Number(e.getElementsByTagName('EarthRadius')[0]?.textContent), f: Number(e.getElementsByTagName('Flattening')[0]?.textContent) }))
+    .filter((e) => e.a > 0 && e.f > 0)
+    .at(-1);
+  const local = (p: Vec3) => (ellipsoid ? ecefToGeodetic(geodeticToEcef(...p), ellipsoid.a, ellipsoid.f * (2 - ellipsoid.f)) : p);
+  const toGrid = project
+    ? (p: Vec3) => {
+        const on = local(p);
+        const [e, n] = project.forward([deg(on[1]), deg(on[0])]);
+        const [north, east] = crs.adjustment ? applyPlaneAdjustment(crs.adjustment, n, e) : [n, e];
+        return { north, east, elevation: elevationOf(p, on[2], north, east, vertical, options.geoid) };
+      }
+    : undefined;
+
+  const x = new Xml();
+  const ctx: Context = { j, jobName: name, positions: new Map(), held: new Map(), references: new Map(), toGrid };
+  const points: PointState[] = [];
   for (const r of j.topLevel()) {
     const c = new Cursor(r.payload);
     const attrs = { ID: hexId(r.id), TimeStamp: r.time };
+    if (SYSTEM_TYPES.has(r.type)) {
+      writeSystemRecord(x, r, info, options.geoid?.name);
+      continue;
+    }
     switch (r.type) {
-      case RecordType.Units: {
-        x.open('UnitsRecord', attrs);
-        x.el('DistanceUnits', DISTANCE_UNITS[c.at(1).u16()]);
-        x.el('HeightUnits', DISTANCE_UNITS[c.u16()]);
-        x.close('UnitsRecord');
-        break;
-      }
-      case RecordType.Corrections: {
-        x.open('CorrectionsRecord', attrs);
-        const d = c.at(16).u8();
-        x.el('Distances', DISTANCES[d] ?? `Unknown${d}`);
-        x.close('CorrectionsRecord');
-        break;
-      }
-      case RecordType.Ellipsoid: {
-        x.open('EllipsoidRecord', attrs);
-        c.at(3);
-        x.el('EarthRadius', c.f64());
-        x.el('Flattening', c.f64());
-        c.u32();
-        x.el('LocalEllipsoidEPSG', c.i32());
-        x.close('EllipsoidRecord');
-        break;
-      }
-      case RecordType.Projection: {
-        const type = c.at(3).u16();
-        x.open('ProjectionRecord', attrs);
-        x.open('Projection');
-        x.el('Type', PROJECTION_TYPES[type] ?? `Unknown${type}`);
-        // Angles are stored in radians.
-        x.el('CentralLatitude', degOrUndefined(c.at(5).f64()));
-        x.el('CentralLongitude', degOrUndefined(c.at(13).f64()));
-        x.el('Scale', c.at(21).f64());
-        x.el('FalseNorthing', c.at(29).f64());
-        x.el('FalseEasting', c.at(37).f64());
-        x.el('Parallel1', degOrUndefined(c.at(63).f64()));
-        x.el('Parallel2', degOrUndefined(c.at(71).f64()));
-        x.close('Projection');
-        x.open('LocalSite');
-        x.el('Type', 'Grid');
-        // Older versions have two fewer bytes in the middle, so count from the end.
-        projectHeight = c.at(r.payload.length - 41).f64();
-        x.el('ProjectLocationHeight', projectHeight);
-        x.close('LocalSite');
-        x.close('ProjectionRecord');
-        break;
-      }
-      case RecordType.Datum: {
-        x.open('DatumRecord', attrs);
-        x.el('ReferenceGlobalFrameID', c.at(62).i32());
-        x.el('ReferenceGlobalFrameEPSG', c.i32());
-        x.el('ReferenceGlobalFrameEpoch', c.at(74).f64()?.toFixed(2));
-        x.el('ReferenceGlobalFrameName', c.at(82).str());
-        x.el('DisplacementModelName', c.str());
-        x.close('DatumRecord');
-        break;
-      }
-      case RecordType.HorizontalAdjustment: {
-        const type = c.at(3).u16();
-        x.open('HorizontalAdjustmentRecord', attrs);
-        x.el('Type', HORIZONTAL_TYPES[type] ?? `Unknown${type}`);
-        x.el('OriginNorth', c.f64());
-        x.el('OriginEast', c.f64());
-        x.el('TranslationNorth', c.f64());
-        x.el('TranslationEast', c.f64());
-        x.el('Rotation', degOrUndefined(c.f64()));
-        x.el('ScaleFactor', c.f64());
-        x.close('HorizontalAdjustmentRecord');
-        break;
-      }
-      case RecordType.VerticalAdjustment: {
-        const type = c.at(3).u16();
-        x.open('VerticalAdjustmentRecord', attrs);
-        x.el('Type', VERTICAL_TYPES[type] ?? `Unknown${type}`);
-        x.el('OriginNorth', c.f64());
-        x.el('OriginEast', c.f64());
-        x.el('SlopeNorthPerUnit', c.f64());
-        x.el('SlopeEastPerUnit', c.f64());
-        x.el('ConstantAdjustment', c.f64());
-        x.el('GeoidName', c.str());
-        x.close('VerticalAdjustmentRecord');
-        break;
-      }
-      case RecordType.CoordinateSystem: {
-        x.open('CoordinateSystemRecord', attrs);
+      case RecordType.FeatureCoding: {
         c.at(1);
-        x.el('SystemName', c.str());
-        x.el('ZoneName', c.str());
-        x.el('DatumName', c.str());
-        x.close('CoordinateSystemRecord');
+        const library = c.str();
+        c.str();
+        x.open('FeatureCodingRecord', attrs);
+        x.el('LibraryName', library);
+        x.el('SourceFilename', c.str());
+        x.el('AttributesStored', String(!!library));
+        x.close('FeatureCodingRecord');
         break;
       }
-      case RecordType.KinematicTransformations:
-        writeKinematic(x, c, attrs);
+      case RecordType.SurveyEvent: {
+        const event = c.at(1).u8();
+        x.open('SurveyEventRecord', attrs);
+        x.el('Event', SURVEY_EVENTS[event] ?? `Unknown${event}`);
+        x.close('SurveyEventRecord');
         break;
+      }
+      case RecordType.Initialisation: {
+        const event = c.at(1).u8();
+        x.open('InitialisationRecord', attrs);
+        x.el('InitialisationEvent', INITIALISATION_EVENTS[event] ?? `Unknown${event}`);
+        x.open('Time');
+        x.el('GPSWeek', c.at(3).u16());
+        x.el('Seconds', c.f64());
+        x.close('Time');
+        const type = c.at(13).u8();
+        x.el('InitialisationType', INITIALISATION_TYPES[type] ?? `Unknown${type}`);
+        x.close('InitialisationRecord');
+        break;
+      }
+      case RecordType.ActiveMapFiles: {
+        // Only ever one file in the samples, so a second one's layout is unknown.
+        const mapFile = r.payload.length > 2 ? c.at(1).str() : '';
+        x.open('ActiveMapFilesRecord', attrs);
+        x.el('File', mapFile || undefined);
+        x.close('ActiveMapFilesRecord');
+        break;
+      }
+      case RecordType.TimeZone: {
+        x.open('TimeZoneRecord', attrs);
+        x.el('ZoneName', c.at(1).str());
+        x.el('HoursToUTC', c.f64());
+        x.close('TimeZoneRecord');
+        break;
+      }
+      case RecordType.NtripDataSource: {
+        x.open('NTRIPDataSourceRecord', attrs);
+        x.el('MountPoint', c.at(1).str());
+        x.el('DataFormat', c.str());
+        x.el('Solution', c.str());
+        x.el('IPAddress', c.str());
+        x.el('IPPort', c.u16());
+        x.close('NTRIPDataSourceRecord');
+        break;
+      }
+      case RecordType.CalibrationPoint: {
+        x.open('CalibrationPointRecord', attrs);
+        x.el('GridPointName', c.at(1).str());
+        x.el('WGS84PointName', c.str());
+        const dimension = c.u8();
+        x.el('Dimension', DIMENSIONS[dimension] ?? `Unknown${dimension}`);
+        c.u8();
+        // Residuals are empty until the calibration has been computed.
+        const v = c.f64();
+        x.el('HorizontalResidual', c.f64());
+        x.el('VerticalResidual', v);
+        x.el('Residual3D', c.f64());
+        c.o += 24; // the control point's north, east and elevation
+        const [dn, de, du] = [c.f64(), c.f64(), c.f64()];
+        if (dn !== undefined && de !== undefined) {
+          x.open('GridResidual');
+          x.el('DeltaNorth', dn);
+          x.el('DeltaEast', de);
+          x.el('DeltaElevation', du);
+          x.close('GridResidual');
+        }
+        x.close('CalibrationPointRecord');
+        break;
+      }
       case RecordType.GpsEquipment: {
         const e = decodeEquipment(r.payload);
         x.open('GPSEquipmentRecord', attrs);
@@ -666,21 +941,21 @@ export function jobToJxl(bytes: Uint8Array, jobName = ''): string {
       case RecordType.Antenna: {
         const a = decodeAntenna(r.payload);
         const e = j.byId.get(a.equipment);
-        const vertical = e ? (decodeEquipment(e.payload).verticalOffset ?? 0) : 0;
+        const offsetUp = e ? (decodeEquipment(e.payload).verticalOffset ?? 0) : 0;
         x.open('AntennaRecord', attrs);
         x.el('MeasuredHeight', a.measuredHeight);
         x.el('MeasurementType', a.measurementType);
         x.el('GPSEquipmentID', hexId(a.equipment));
-        if (a.measuredHeight !== undefined) x.el('ReducedHeight', a.measuredHeight + vertical);
+        if (a.measuredHeight !== undefined) x.el('ReducedHeight', a.measuredHeight + offsetUp);
         x.close('AntennaRecord');
         break;
       }
       case RecordType.Reference: {
-        const name = c.at(1).str();
+        const base = c.at(1).str();
         const antenna = c.u32();
-        references.set(r.id, { name, antenna });
+        ctx.references.set(r.id, { name: base, antenna });
         x.open('ReferenceRecord', attrs);
-        x.el('PointName', name);
+        x.el('PointName', base);
         x.el('AntennaID', hexId(antenna));
         x.close('ReferenceRecord');
         break;
@@ -693,38 +968,23 @@ export function jobToJxl(bytes: Uint8Array, jobName = ''): string {
         x.close('NoteRecord');
         break;
       }
-      case RecordType.Point: {
-        const state = writePoint(x, j, r, positions, references, name);
-        points.push(state);
+      case RecordType.Point:
+        points.push(writePoint(x, ctx, r));
         break;
-      }
     }
   }
-
   x.close('FieldBook');
 
-  const head = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    `<JOBFile jobName="${esc(name)}" product="Trimble Access" productDBVersion="${file.version}"` +
-      ` controllerSerialNumber="${esc(created?.serial ?? '')}" originalProductVersion="${esc(created?.version ?? '')}"` +
-      ` sourceFormat="JOB" TimeStamp="${header?.time ?? ''}">`,
-    '  <FieldBook>',
-  ];
-
-  // Trimble Access works out grid coordinates and the combined scale factor
-  // when it exports; the JOB only has the coordinate system. Read it back from
-  // the records written so far and do the same here.
-  const fieldBook = new DOMParser().parseFromString([...head, ...x.out, '</JOBFile>'].join('\n'), 'application/xml');
-  const crs = detectCrs(fieldBook.documentElement);
-  const toGrid = crs.projection ? proj4('EPSG:4326', crs.projection.proj4) : undefined;
-  const grid = (p: Vec3) => {
-    const [e, n] = toGrid!.forward([deg(p[1]), deg(p[0])]);
-    return crs.adjustment ? applyPlaneAdjustment(crs.adjustment, n, e) : [n, e];
-  };
-
-  x.open('Reductions');
+  // One point per name, chosen the way Trimble Access searches its database.
+  const reduced = new Map<string, PointState>();
   for (const p of points) {
     if (p.deleted) continue;
+    const held = reduced.get(p.point.name);
+    if (!held || supersedes(p.point, held.point)) reduced.set(p.point.name, p);
+  }
+  x.open('Reductions');
+  for (const p of points) {
+    if (reduced.get(p.point.name) !== p) continue;
     x.open('Point');
     x.el('ID', hexId(p.record.id));
     x.el('Name', p.point.name);
@@ -732,38 +992,82 @@ export function jobToJxl(bytes: Uint8Array, jobName = ''): string {
     x.el('SurveyMethod', p.point.surveyMethod);
     x.el('Classification', p.point.classification);
     writeWgs84(x, p.wgs84);
-    // Elevations of measured points need the geoid model, which isn't here.
-    const g = p.grid ?? (toGrid && p.wgs84 ? { north: grid(p.wgs84)[0], east: grid(p.wgs84)[1], elevation: undefined } : undefined);
-    if (g) {
-      x.open('Grid');
-      x.el('North', g.north);
-      x.el('East', g.east);
-      x.el('Elevation', g.elevation);
-      x.close('Grid');
-    }
+    writeGrid(x, 'Grid', p.grid);
     x.close('Point');
   }
   x.close('Reductions');
 
-  const located = points.filter((p) => !p.deleted && p.wgs84).map((p) => p.wgs84!);
-  if (toGrid && located.length && projectHeight !== undefined) {
-    const lat = located.reduce((s, p) => s + p[0], 0) / located.length;
-    const lon = located.reduce((s, p) => s + p[1], 0) / located.length;
-    x.open('Environment');
-    x.open('CoordinateSystem');
+  x.open('Environment');
+  x.open('CoordinateSystem');
+  x.el('SystemName', info.systemName);
+  x.el('ZoneName', info.zoneName);
+  x.el('DatumName', info.datumName);
+  // Trimble Access gives the combined scale factor at the middle of the job:
+  // the mean of its points' grid coordinates, at the project height.
+  const onGrid = [...reduced.values()].filter((p) => p.grid).map((p) => p.grid!);
+  if (project && onGrid.length && info.projectHeight !== undefined) {
+    const north = onGrid.reduce((s, g) => s + g.north, 0) / onGrid.length;
+    const east = onGrid.reduce((s, g) => s + g.east, 0) / onGrid.length;
+    const [n, e] = crs.adjustment ? removePlaneAdjustment(crs.adjustment, north, east) : [north, east];
+    const [lon, lat] = project.inverse([e, n]);
     x.open('CombinedScaleFactor');
     x.open('Location');
-    x.el('Latitude', deg(lat));
-    x.el('Longitude', deg(lon));
-    x.el('Height', projectHeight);
+    x.el('Latitude', lat);
+    x.el('Longitude', lon);
+    x.el('Height', info.projectHeight);
     x.close('Location');
-    x.el('Scale', combinedScaleFactor(toGrid, lat, lon, projectHeight));
+    x.el('Scale', combinedScaleFactor(project, lat / DEG, lon / DEG, info.projectHeight));
     x.close('CombinedScaleFactor');
-    x.close('CoordinateSystem');
-    x.close('Environment');
   }
+  x.close('CoordinateSystem');
+  if (info.distanceUnits || info.heightUnits) {
+    x.open('DisplaySettings');
+    x.el('DistanceUnits', info.distanceUnits);
+    x.el('HeightUnits', info.heightUnits);
+    x.close('DisplaySettings');
+  }
+  x.close('Environment');
 
   return [...head, ...x.out, '</JOBFile>', ''].join('\n');
+}
+
+// Trimble Access's search rules: of several points with one name, the
+// highest class is the point. Within a class the oldest stands, except that
+// a newer control point replaces an older one. Only Averaged over Normal and
+// Normal over Check are borne out by the samples; the rest follows Trimble's
+// documentation.
+const CLASS_RANK = ['Control', 'Averaged', 'Adjusted', 'Normal', 'Construction', 'Check'];
+
+function supersedes(candidate: JobPointRecord, held: JobPointRecord): boolean {
+  const rank = (p: JobPointRecord) => {
+    const i = CLASS_RANK.indexOf(p.classification);
+    return i < 0 ? CLASS_RANK.length : i;
+  };
+  return rank(candidate) < rank(held) || (rank(candidate) === rank(held) && candidate.classification === 'Control');
+}
+
+/**
+ * Elevation of a WGS84 position under the job's vertical adjustment: the
+ * ellipsoid height less the geoid height, plus the calibration's inclined
+ * plane where there is one. Undefined without the geoid model.
+ */
+function elevationOf(
+  p: Vec3,
+  height: number,
+  north: number,
+  east: number,
+  v: VerticalAdjustment | undefined,
+  geoid: GeoidGrid | undefined,
+): number | undefined {
+  if (!v || !geoid || !v.type.includes('Geoid')) return undefined;
+  const n = undulation(geoid, deg(p[0]), deg(p[1]));
+  if (n === undefined) return undefined;
+  let elevation = height - n;
+  if (v.type.includes('InclinedPlane')) {
+    // Only the constant is checked against JobXML: every sample's slopes are zero.
+    elevation += v.constant + v.slopeNorth * (north - (v.originNorth ?? north)) + v.slopeEast * (east - (v.originEast ?? east));
+  }
+  return elevation;
 }
 
 function writeKinematic(x: Xml, c: Cursor, attrs: Record<string, string>) {
@@ -802,6 +1106,10 @@ function noteText(payload: Uint8Array): string {
   return new TextDecoder().decode(payload).replace(/\0+$/, '').trim();
 }
 
+function noteLines(text: string): string[] {
+  return text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+}
+
 function codeOf(features: JobFeature[]): string {
   return features.map((f) => f.name).join(' ');
 }
@@ -815,18 +1123,23 @@ function writeWgs84(x: Xml, p: Vec3 | undefined) {
   x.close('WGS84');
 }
 
-function writePoint(
-  x: Xml,
-  j: Journal,
-  r: JobRecord,
-  positions: Map<string, Vec3>,
-  references: Map<number, { name: string; antenna: number }>,
-  jobName: string,
-): PointState {
+function writeGrid(x: Xml, tag: string, g: PointState['grid']) {
+  if (!g) return;
+  x.open(tag);
+  x.el('North', g.north);
+  x.el('East', g.east);
+  x.el('Elevation', g.elevation);
+  x.close(tag);
+}
+
+function writePoint(x: Xml, ctx: Context, r: JobRecord): PointState {
+  const { j, positions, references } = ctx;
   const point = decodePoint(r.payload);
-  // A later attribute edit carries the point's whole feature list again.
+  // A rename, and a later attribute edit, each carry the new value whole.
+  const renamed = j.latestChild(r.id, RecordType.JobName);
+  if (renamed) point.name = new Cursor(renamed.payload, 2).str();
   const edited = j.latestChild(r.id, RecordType.Features);
-  if (edited) point.features = readFeatures(new Cursor(edited.payload));
+  if (edited) point.features = readFeatures(new Cursor(edited.payload, 1));
   const del = j.latestChild(r.id, RecordType.Deleted);
   const deleted = !!del && del.payload[1] === 0;
   const state: PointState = { record: r, point, deleted };
@@ -842,6 +1155,7 @@ function writePoint(
   x.el('SurveyMethod', point.surveyMethod);
   x.el('Classification', point.classification);
   x.el('Deleted', String(deleted));
+  x.el('Source', point.sourceFile || undefined);
   // Like JobXML, only codes that carry feature attributes are listed as
   // features. Plain codes and control codes (BL, EL...) are only in the code.
   const withAttributes = point.features.filter((f) => f.attributes.length);
@@ -853,7 +1167,7 @@ function writePoint(
         x.open('Attribute');
         x.el('Name', a.name);
         // Photos live in the job's "<job> Files" folder, which JobXML spells out.
-        x.el('Value', a.type === 'Photo' && a.value ? `${jobName} Files/${a.value}` : a.value);
+        x.el('Value', a.type === 'Photo' && a.value ? `${ctx.jobName} Files/${a.value}` : a.value);
         x.el('Type', a.type);
         x.el('ItemIndex', a.itemIndex);
         x.close('Attribute');
@@ -867,6 +1181,8 @@ function writePoint(
   const grid = j.latestChild(r.id, RecordType.GridPosition);
   const vector = j.latestChild(r.id, RecordType.GnssVectorTilted) ?? j.latestChild(r.id, RecordType.GnssVector);
   const polar = j.latestChild(r.id, RecordType.Polar);
+  // A measured point's position is worked out here, not stored.
+  let measured = false;
 
   if (wgs) {
     const c = new Cursor(wgs.payload, 1);
@@ -876,11 +1192,7 @@ function writePoint(
   if (grid) {
     const c = new Cursor(grid.payload, 1);
     state.grid = { north: c.f64Raw(), east: c.f64Raw(), elevation: c.f64() };
-    x.open('Grid');
-    x.el('North', state.grid.north);
-    x.el('East', state.grid.east);
-    x.el('Elevation', state.grid.elevation);
-    x.close('Grid');
+    writeGrid(x, 'Grid', state.grid);
   }
   if (vector) {
     const v = decodeVector(vector.payload);
@@ -894,13 +1206,17 @@ function writePoint(
     x.el('ReferenceRecordID', hexId(v.reference));
     x.el('RTK_Base', baseName);
     x.el('AntennaID', hexId(v.antenna));
-    if (v.attitude) {
+    // An electronic bubble's tilt is noted with the shot but, unlike IMU
+    // tilt, isn't used to move the point.
+    const bubble = nextOfType(j, r, RecordType.BubbleTilt);
+    if (v.attitude || bubble) {
+      const b = bubble && new Cursor(bubble.payload, 2);
       x.open('DeviceAxisOrientation');
-      x.el('Type', 'InertialTiltComp');
+      x.el('Type', v.attitude ? 'InertialTiltComp' : 'VerticalTiltError');
       x.open('Attitude');
-      x.el('Pitch', deg(v.attitude.pitch));
-      x.el('Roll', deg(v.attitude.roll));
-      x.el('Yaw', deg(v.attitude.yaw));
+      x.el('Pitch', deg(v.attitude ? v.attitude.pitch : b!.f64Raw()));
+      x.el('Roll', deg(v.attitude ? v.attitude.roll : b!.f64Raw()));
+      if (v.attitude) x.el('Yaw', deg(v.attitude.yaw));
       x.close('Attitude');
       x.close('DeviceAxisOrientation');
     }
@@ -912,6 +1228,7 @@ function writePoint(
       const base = offset(mark, enuToEcef(mark[0], mark[1], 0, 0, baseHeight));
       const apc = offset(base, [v.dx, v.dy, v.dz]);
       state.wgs84 = groundUnderAntenna(apc, height, v.attitude);
+      measured = true;
     }
   }
   if (polar) {
@@ -931,9 +1248,29 @@ function writePoint(
     x.el('AzimuthType', azimuthType === 0x49 ? 'WGS84' : `Unknown${azimuthType}`);
     x.el('DistanceType', distanceType === 4 ? 'Ground' : `Unknown${distanceType}`);
     const from = positions.get(source);
-    if (from) state.wgs84 = offset(from, enuToEcef(from[0], from[1], hd * Math.sin(azimuth), hd * Math.cos(azimuth), vd));
+    if (from) {
+      state.wgs84 = offset(from, enuToEcef(from[0], from[1], hd * Math.sin(azimuth), hd * Math.cos(azimuth), vd));
+      measured = true;
+    }
+  }
+  // Grid coordinates of anything that only has a WGS84 position. JobXML
+  // calls them computed, to tell them from keyed-in ones.
+  if (!state.grid && state.wgs84 && ctx.toGrid) {
+    state.grid = ctx.toGrid(state.wgs84);
+    if (measured || wgs) writeGrid(x, 'ComputedGrid', state.grid);
   }
 
+  const sd = nextOfType(j, r, RecordType.GridStandardDeviations);
+  if (sd) {
+    const c = new Cursor(sd.payload, 1);
+    x.open('GridStandardDeviations');
+    x.el('NorthStandardDeviation', c.f64());
+    x.el('EastStandardDeviation', c.f64());
+    x.el('ElevationStandardDeviation', c.f64());
+    x.close('GridStandardDeviations');
+  }
+  const residuals = nextOfType(j, r, RecordType.AverageResiduals);
+  if (residuals) writeAverageResiduals(x, residuals.payload);
   const precision = nextOfType(j, r, RecordType.Precision);
   if (precision) {
     const c = new Cursor(precision.payload, 1);
@@ -944,10 +1281,21 @@ function writePoint(
   }
   const qc = nextOfType(j, r, RecordType.QualityControl1);
   if (qc) writeQc1(x, new Cursor(qc.payload));
+  const qc2 = nextOfType(j, r, RecordType.QualityControl2);
+  if (qc2) {
+    const c = new Cursor(qc2.payload, 1);
+    x.open('QualityControl2');
+    x.el('NumberOfSatellites', c.u16());
+    x.el('ErrorScale', c.f64());
+    for (const tag of ['VCVxx', 'VCVxy', 'VCVxz', 'VCVyy', 'VCVyz', 'VCVzz']) x.el(tag, c.f64());
+    x.el('UnitVariance', c.f64());
+    x.close('QualityControl2');
+  }
 
-  // Each note record repeats the earlier ones, newest first, a line each.
+  // A point edited before it was stored carries its note itself; later
+  // edits add note records, each repeating the earlier ones, newest first.
   const note = j.latestChild(r.id, RecordType.Note);
-  const notes = note ? noteText(note.payload).split(/\r?\n/).map((l) => l.trim()).filter(Boolean) : [];
+  const notes = noteLines(note ? noteText(note.payload) : point.note);
   if (notes.length) {
     x.open('Notes');
     for (const n of notes) x.el('Note', n);
@@ -955,8 +1303,35 @@ function writePoint(
   }
   x.close('PointRecord');
 
-  if (!deleted && state.wgs84) positions.set(point.name, state.wgs84);
+  if (!deleted && state.wgs84) {
+    const held = ctx.held.get(point.name);
+    if (!held || supersedes(point, held)) {
+      positions.set(point.name, state.wgs84);
+      ctx.held.set(point.name, point);
+    }
+  }
   return state;
+}
+
+/** How each observation of an averaged point differs from the average. */
+function writeAverageResiduals(x: Xml, payload: Uint8Array) {
+  const c = new Cursor(payload, 1);
+  const n = c.u32();
+  x.open('AverageResiduals');
+  for (let i = 0; i < n && 5 + 72 * (i + 1) <= payload.length; i++) {
+    c.at(5 + 72 * i + 17);
+    x.open('AverageResidual');
+    x.el('ObservationID', hexId(c.u32()));
+    x.el('IncludedInAverageComputation', String(c.u8() !== 0));
+    const [dn, de, du] = [c.f64(), c.f64(), c.f64()];
+    x.open('GridResidual');
+    x.el('DeltaNorth', dn);
+    x.el('DeltaEast', de);
+    x.el('DeltaElevation', du);
+    x.close('GridResidual');
+    x.close('AverageResidual');
+  }
+  x.close('AverageResiduals');
 }
 
 /**
@@ -987,10 +1362,9 @@ function writeQc1(x: Xml, c: Cursor) {
   systems.slice(0, 5).forEach((s, i) => x.el(`Min${s}SVs`, min[i + 1]));
   x.el('NumberOfSatellites', used[0]);
   systems.forEach((s, i) => x.el(`Num${s}SVs`, used[i + 1]));
-  x.el('PDOP', c.at(30).f64());
-  x.el('GDOP', c.f64());
-  x.el('HDOP', c.f64());
-  x.el('VDOP', c.f64());
+  c.at(30);
+  for (const tag of ['PDOP', 'GDOP', 'HDOP', 'VDOP']) x.el(tag, c.f64());
+  for (const tag of ['PDOP', 'GDOP', 'HDOP', 'VDOP']) x.el(`${tag}_AtStore`, c.f64());
   x.el('NumberOfPositionsUsed', c.at(102).u16());
   x.open('StartTime');
   x.el('GPSWeek', c.at(154).u16());
@@ -1000,8 +1374,7 @@ function writeQc1(x: Xml, c: Cursor) {
   x.el('GPSWeek', c.at(164).u16());
   x.el('Seconds', c.f64());
   x.close('EndTime');
-  const age = c.at(176).f64();
-  x.el('RTCMAge', age === undefined ? undefined : Math.round(age * 1e6) / 1e6);
+  x.el('RTCMAge', c.at(176).f64());
   x.close('QualityControl1');
 }
 
@@ -1034,6 +1407,6 @@ function antennaHeight(j: Journal, antennaId: number): number | undefined {
 }
 
 /** Parse a JOB file into the same document the JobXML parser produces. */
-export function parseJob(bytes: Uint8Array, options: ParseOptions & { jobName?: string } = {}): JxlDocument {
-  return { ...parseJxl(jobToJxl(bytes, options.jobName), options), format: 'job' };
+export function parseJob(bytes: Uint8Array, options: ParseOptions & JobOptions = {}): JxlDocument {
+  return { ...parseJxl(jobToJxl(bytes, options), options), format: 'job' };
 }

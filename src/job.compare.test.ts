@@ -7,16 +7,25 @@
 //   JOB_PAIRS=~/jobs npx vitest run src/job.compare.test.ts
 //
 // A JXL exported earlier than its JOB is fine: points the JXL doesn't have yet
-// are skipped.
+// are skipped. Add JOB_GEOID=<path to the job's geoid .ggf> to check
+// elevations too; without it the JOB reader has none to compare.
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readGgf } from './geoid';
 import { parseJob } from './job';
 import { parseJxl, type JxlPoint } from './jxl';
 
 const dir = process.env.JOB_PAIRS;
 const pairs = dir ? readdirSync(dir).filter((f) => /\.job$/i.test(f)).map((f) => f.replace(/\.job$/i, '')) : [];
+
+const geoid = process.env.JOB_GEOID ? readGgf(new Uint8Array(readFileSync(process.env.JOB_GEOID))) : undefined;
+
+/** Numbers to the nearest 0.01 mm (or 1e-5 of whatever they are), so two reductions of the same thing compare equal. */
+function rounded(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value ?? null, (_, v) => (typeof v === 'number' ? Math.round(v * 1e5) / 1e5 : v)));
+}
 
 /** Metres on the ground for a lat/lon difference in degrees. */
 function horizontal(a: JxlPoint, b: JxlPoint): number {
@@ -25,16 +34,21 @@ function horizontal(a: JxlPoint, b: JxlPoint): number {
   return Math.hypot(dn, de);
 }
 
+// Shown from JobXML fields the JOB reader doesn't decode yet.
+const SKIPPED = new Set(['Warnings at storage']);
+
 describe.skipIf(!pairs.length)('JOB against JXL', () => {
   for (const name of pairs) {
     it(name, () => {
-      const job = parseJob(new Uint8Array(readFileSync(join(dir!, `${name}.job`))));
+      const job = parseJob(new Uint8Array(readFileSync(join(dir!, `${name}.job`))), { geoid });
       const jxl = parseJxl(readFileSync(join(dir!, `${name}.jxl`), 'utf8'));
       const byId = new Map(job.points.map((p) => [p.id, p]));
       const problems: string[] = [];
       let compared = 0;
       let worst = 0;
       let worstGrid = 0;
+      let worstElevation = 0;
+      let elevations = 0;
       for (const want of jxl.points) {
         const got = byId.get(want.id);
         if (!got) {
@@ -73,8 +87,25 @@ describe.skipIf(!pairs.length)('JOB against JXL', () => {
           worstGrid = Math.max(worstGrid, g);
           if (!(g < 0.001)) problems.push(`${want.name}: grid off by ${g.toFixed(4)} m`);
         }
+        if (want.coords.elevation !== undefined && (geoid || want.coords.lat === undefined)) {
+          const d = Math.abs((got.coords.elevation ?? NaN) - want.coords.elevation);
+          elevations++;
+          worstElevation = Math.max(worstElevation, d);
+          if (!(d < 0.0005)) problems.push(`${want.name}: elevation ${got.coords.elevation} != ${want.coords.elevation}`);
+        }
+        diff('observation', rounded(got.observation.map((g) => ({ ...g, props: g.props.filter((p) => !SKIPPED.has(p.label)) }))), rounded(want.observation.map((g) => ({ ...g, props: g.props.filter((p) => !SKIPPED.has(p.label)) }))));
       }
-      console.log(`${name}: ${compared} of ${jxl.points.length} JXL points compared, ${job.points.length} in the JOB; worst position ${(worst * 1000).toFixed(2)} mm, grid ${(worstGrid * 1000).toFixed(2)} mm`);
+      // The calibration tab's content: adjustments, pairs and residuals, RTK bases.
+      const calibration = (c: typeof jxl.calibration) => rounded(c && { ...c, vertical: c.vertical && { ...c.vertical, geoid: undefined } });
+      const [gotCalibration, wantCalibration] = [calibration(job.calibration), calibration(jxl.calibration)];
+      if (JSON.stringify(gotCalibration) !== JSON.stringify(wantCalibration)) {
+        problems.push(`calibration: ${JSON.stringify(gotCalibration)} != ${JSON.stringify(wantCalibration)}`);
+      }
+      expect(job.points.length).toBe(jxl.points.length);
+      console.log(
+        `${name}: ${compared} of ${jxl.points.length} JXL points compared, ${job.points.length} in the JOB; worst position ${(worst * 1000).toFixed(2)} mm, ` +
+          `grid ${(worstGrid * 1000).toFixed(2)} mm, elevation ${(worstElevation * 1000).toFixed(2)} mm on ${elevations} points`,
+      );
       expect(problems.slice(0, 40)).toEqual([]);
     });
   }
